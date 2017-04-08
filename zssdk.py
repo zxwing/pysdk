@@ -39,7 +39,7 @@ def _exception_safe(func):
     def wrap(*args, **kwargs):
         try:
             func(*args, **kwargs)
-        except Exception:
+        except:
             print traceback.format_exc()
 
     return wrap
@@ -71,8 +71,8 @@ def configure(
         port=8080,
         polling_timeout=3600*3,
         polling_interval=1,
-        read_timeout=None,
-        write_timeout=None,
+        read_timeout=15,
+        write_timeout=15,
         web_hook=None
 ):
     __config__[CONFIG_HOSTNAME] = hostname
@@ -142,10 +142,12 @@ class AbstractAction(object):
             'systemTags': ParamAnnotation(),
             'userTags': ParamAnnotation(),
             'resourceUuid': ParamAnnotation()
-        }.update(self.PARAMS)
+        }
+
+        self._param_descriptors.update(self.PARAMS)
 
     def _check_params(self):
-        for param_name, annotation in self._param_descriptors:
+        for param_name, annotation in self._param_descriptors.items():
             value = getattr(self, param_name, None)
 
             if value is None and annotation.required:
@@ -157,7 +159,7 @@ class AbstractAction(object):
             if value is not None and isinstance(value, str) and annotation.max_length and len(value) > annotation.max_length:
                 raise SdkError('invalid length[%s] of the parameter[%s], the max allowed length is %s' % (len(value), param_name, annotation.max_length))
 
-            if value is not None and isinstance(value, str) and annotation.max_length and len(value) > annotation.min_length:
+            if value is not None and isinstance(value, str) and annotation.min_length and len(value) > annotation.min_length:
                 raise SdkError('invalid length[%s] of the parameter[%s], the minimal allowed length is %s' % (len(value), param_name, annotation.min_length))
 
             if value is not None and isinstance(value, list) and annotation.non_empty is True and len(value) == 0:
@@ -181,7 +183,7 @@ class AbstractAction(object):
 
     def _params(self):
         ret = {}
-        for k, _ in self._param_descriptors:
+        for k, _ in self._param_descriptors.items():
             val = getattr(self, k, None)
             if val is not None:
                 ret[k] = val
@@ -189,7 +191,7 @@ class AbstractAction(object):
         return ret
 
     def _url(self):
-        elements = ['http://', __config__[CONFIG_HOSTNAME], __config__[CONFIG_PORT]]
+        elements = ['http://', __config__[CONFIG_HOSTNAME], ':', str(__config__[CONFIG_PORT]), '/v1']
 
         path = self.PATH.replace('{', '${')
         unresolved = re.findall('${(.+?)}', path)
@@ -227,6 +229,9 @@ class AbstractAction(object):
         else:
             headers[HEADER_JOB_UUID] = _uuid()
 
+        if self.NEED_SESSION:
+            headers[HEADER_AUTHORIZATION] = "%s %s" % (OAUTH, self.sessionId)
+
         web_hook = __config__.get(CONFIG_WEBHOOK, None)
         if web_hook is not None:
             headers[CONFIG_WEBHOOK] = web_hook
@@ -235,7 +240,7 @@ class AbstractAction(object):
         body = None
         if self.HTTP_METHOD == 'POST' or self.HTTP_METHOD == 'PUT':
             m = {}
-            for k, v in params:
+            for k, v in params.items():
                 if v is None:
                     continue
 
@@ -252,7 +257,7 @@ class AbstractAction(object):
         rsp = _json_http(uri=url, body=body, headers=headers, method=self.HTTP_METHOD, timeout=self.timeout)
 
         if rsp.status < 200 or rsp.status >= 300:
-            return _return(Obj(_http_error(rsp.status, rsp.body)))
+            return _return(Obj(_http_error(rsp.status, rsp.data)))
         elif rsp.status == 200 or rsp.status == 204:
             # the API completes
             return _return(Obj(self._write_result(rsp)))
@@ -260,13 +265,13 @@ class AbstractAction(object):
             # the API needs polling
             return self._poll_result(rsp, cb)
         else:
-            raise SdkError('[Internal Error] the server returns an unknown status code[%s], body[%s]' % (rsp.status, rsp.body))
+            raise SdkError('[Internal Error] the server returns an unknown status code[%s], body[%s]' % (rsp.status, rsp.data))
 
     def _write_result(self, rsp):
         if rsp.status == 200:
-            return {"value": json.loads(rsp.body)}
+            return {"value": json.loads(rsp.data)}
         elif rsp.status == 503:
-            return json.loads(rsp.body)
+            return json.loads(rsp.data)
         else:
             raise SdkError('unknown status code[%s]' % rsp.status)
 
@@ -274,7 +279,7 @@ class AbstractAction(object):
         if not self.NEED_POLL:
             raise SdkError('[Internal Error] the api is not an async API but the server returns 202 status code')
 
-        m = json.loads(rsp.body)
+        m = json.loads(rsp.data)
         location = m[LOCATION]
         if not location:
             raise SdkError("Internal Error] the api[%s] is an async API but the server doesn't return the polling location url")
@@ -306,11 +311,12 @@ class AbstractAction(object):
         def _polling():
             rsp = _json_http(
                 uri=location,
-                headers={HEADER_AUTHORIZATION: "%s %s" % (OAUTH, self.sessionId)}
+                headers={HEADER_AUTHORIZATION: "%s %s" % (OAUTH, self.sessionId)},
+                method='GET'
             )
 
             if rsp.status not in [200, 503, 202]:
-                cb(Obj(_http_error(rsp.status, rsp.body)))
+                cb(Obj(_http_error(rsp.status, rsp.data)))
                 _cancel()
             elif rsp.status in [200, 503]:
                 cb(Obj(self._write_result(rsp)))
@@ -332,11 +338,12 @@ class AbstractAction(object):
         while count < self.timeout:
             rsp = _json_http(
                 uri=location,
-                headers={HEADER_AUTHORIZATION: "%s %s" % (OAUTH, self.sessionId)}
+                headers={HEADER_AUTHORIZATION: "%s %s" % (OAUTH, self.sessionId)},
+                method='GET'
             )
 
             if rsp.status not in [200, 503, 202]:
-                return Obj(_http_error(rsp.status, rsp.body))
+                return Obj(_http_error(rsp.status, rsp.data))
 
             time.sleep(self.pollingInterval)
             count += self.pollingInterval
@@ -362,24 +369,29 @@ def _json_http(
         timeout=120.0
 ):
     pool = urllib3.PoolManager(timeout=timeout, retries=urllib3.util.retry.Retry(15))
+    #pool = urllib3.PoolManager()
     headers.update({'Content-Type': 'application/json', 'Connection': 'close'})
 
     if body is not None and not isinstance(body, str):
         body = json.dumps(body).encode('utf-8')
 
+    print '[Request]: url=%s, headers=%s, body=%s' % (uri, headers, body)
     if body:
         headers['Content-Length'] = len(body)
-        return pool.request(method, uri, body=body, headers=headers)
+        rsp = pool.request(method, uri, body=body, headers=headers)
     else:
-        return pool.request(method, uri, headers=headers)
+        rsp = pool.request(method, uri, headers=headers)
+
+    print '[Resposne to %s]: status: %s, body: %s' % (uri, rsp.status, rsp.data)
+    return rsp
 
 
 class CreateZoneAction(AbstractAction):
 
     HTTP_METHOD = 'POST'
     PATH = '/zones'
-    NEED_SESSION = True,
-    NEED_POLL = True,
+    NEED_SESSION = True
+    NEED_POLL = True
     PARAM_NAME = 'params'
 
     PARAMS = {
@@ -391,5 +403,24 @@ class CreateZoneAction(AbstractAction):
         super(CreateZoneAction, self).__init__()
         self.name = None
         self.description = None
+
+
+class LogInByAccountAction(AbstractAction):
+    HTTP_METHOD = 'PUT'
+    PATH = '/accounts/login'
+    NEED_SESSION = False
+    NEED_POLL = False
+    PARAM_NAME = 'logInByAccount'
+
+    PARAMS = {
+        'accountName': ParamAnnotation(required=True),
+        'password': ParamAnnotation(required=True)
+    }
+
+    def __init__(self):
+        super(LogInByAccountAction, self).__init__()
+        self.password = None
+        self.accountName = None
+
 
 
