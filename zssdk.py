@@ -3,6 +3,10 @@ import urllib3
 import string
 import json
 from uuid import uuid4
+import time
+import threading
+import functools
+import traceback
 
 CONFIG_HOSTNAME = 'hostname'
 CONFIG_PORT = 'port'
@@ -17,6 +21,7 @@ HEADER_WEBHOOK = "X-Web-Hook"
 HEADER_JOB_SUCCESS = "X-Job-Success"
 HEADER_AUTHORIZATION = "Authorization"
 OAUTH = "OAuth"
+LOCATION = "location"
 
 HTTP_ERROR = "sdk.1000"
 POLLING_TIMEOUT_ERROR = "sdk.1001"
@@ -29,15 +34,36 @@ class SdkError(Exception):
     pass
 
 
-class HttpError(Exception):
-    def __init__(self, status, body=None):
-        self.status = status
-        self.body = body
+def _exception_safe(func):
+    @functools.wraps(func)
+    def wrap(*args, **kwargs):
+        try:
+            func(*args, **kwargs)
+        except Exception:
+            print traceback.format_exc()
+
+    return wrap
 
 
 def _error_if_not_configured():
     if not __config__:
         raise SdkError('call configure() before using any APIs')
+
+
+def _http_error(status, body=None):
+    err = ErrorCode()
+    err.code = HTTP_ERROR
+    err.description = 'the http status code[%s] indicates a failure happened' % status
+    err.details = body
+    return {'error': err}
+
+
+def _error(code, desc, details):
+    err = ErrorCode()
+    err.code = code
+    err.desc = desc
+    err.details = details
+    return {'error': err}
 
 
 def configure(
@@ -90,6 +116,15 @@ class ErrorCode(object):
         self.description = None
         self.details = None
         self.cause = None
+
+
+class Obj(object):
+    def __init__(self, d):
+        for a, b in d.items():
+            if isinstance(b, (list, tuple)):
+                setattr(self, a, [Obj(x) if isinstance(x, dict) else x for x in b])
+            else:
+                setattr(self, a, Obj(b) if isinstance(b, dict) else b)
 
 
 class AbstractAction(object):
@@ -173,8 +208,14 @@ class AbstractAction(object):
 
         return ''.join(elements), unresolved
 
-
     def call(self, cb=None):
+
+        def _return(result):
+            if cb:
+                cb(result)
+            else:
+                return result
+
         _error_if_not_configured()
 
         self._check_params()
@@ -210,6 +251,99 @@ class AbstractAction(object):
 
         rsp = _json_http(uri=url, body=body, headers=headers, method=self.HTTP_METHOD, timeout=self.timeout)
 
+        if rsp.status < 200 or rsp.status >= 300:
+            return _return(Obj(_http_error(rsp.status, rsp.body)))
+        elif rsp.status == 200 or rsp.status == 204:
+            # the API completes
+            return _return(Obj(self._write_result(rsp)))
+        elif rsp.status == 202:
+            # the API needs polling
+            return self._poll_result(rsp, cb)
+        else:
+            raise SdkError('[Internal Error] the server returns an unknown status code[%s], body[%s]' % (rsp.status, rsp.body))
+
+    def _write_result(self, rsp):
+        if rsp.status == 200:
+            return {"value": json.loads(rsp.body)}
+        elif rsp.status == 503:
+            return json.loads(rsp.body)
+        else:
+            raise SdkError('unknown status code[%s]' % rsp.status)
+
+    def _poll_result(self, rsp, cb):
+        if not self.NEED_POLL:
+            raise SdkError('[Internal Error] the api is not an async API but the server returns 202 status code')
+
+        m = json.loads(rsp.body)
+        location = m[LOCATION]
+        if not location:
+            raise SdkError("Internal Error] the api[%s] is an async API but the server doesn't return the polling location url")
+
+        if cb:
+            # async polling
+            self._async_poll(location, cb)
+        else:
+            # sync polling
+            return self._sync_polling(location)
+
+    def _fill_timeout_parameters(self):
+        if self.timeout is None:
+            self.timeout = __config__.get(CONFIG_POLLING_TIMEOUT)
+
+        if self.pollingInterval is None:
+            self.pollingInterval = __config__.get(CONFIG_POLLING_INTERVAL)
+
+    def _async_poll(self, location, cb):
+        self._fill_timeout_parameters()
+
+        timer = None
+        count = [0]
+
+        def _cancel():
+            timer.cancel()
+
+        @_exception_safe
+        def _polling():
+            rsp = _json_http(
+                uri=location,
+                headers={HEADER_AUTHORIZATION: "%s %s" % (OAUTH, self.sessionId)}
+            )
+
+            if rsp.status not in [200, 503, 202]:
+                cb(Obj(_http_error(rsp.status, rsp.body)))
+                _cancel()
+            elif rsp.status in [200, 503]:
+                cb(Obj(self._write_result(rsp)))
+                _cancel()
+            else:
+                count[0] += self.pollingInterval
+                if count[0] >= self.timeout:
+                    cb(Obj(_error(POLLING_TIMEOUT_ERROR, 'polling an API result time out',
+                                  'failed to poll the result after %s seconds' % self.timeout)))
+                    _cancel()
+
+        timer = threading.Timer(_polling, self.pollingInterval)
+        timer.start()
+
+    def _sync_polling(self, location):
+        count = 0
+        self._fill_timeout_parameters()
+
+        while count < self.timeout:
+            rsp = _json_http(
+                uri=location,
+                headers={HEADER_AUTHORIZATION: "%s %s" % (OAUTH, self.sessionId)}
+            )
+
+            if rsp.status not in [200, 503, 202]:
+                return Obj(_http_error(rsp.status, rsp.body))
+
+            time.sleep(self.pollingInterval)
+            count += self.pollingInterval
+
+        return Obj(_error(POLLING_TIMEOUT_ERROR, 'polling an API result time out',
+                          'failed to poll the result after %s seconds' % self.timeout))
+
 
 class QueryAction(AbstractAction):
     def __init__(self):
@@ -239,6 +373,7 @@ def _json_http(
     else:
         return pool.request(method, uri, headers=headers)
 
+
 class CreateZoneAction(AbstractAction):
 
     HTTP_METHOD = 'POST'
@@ -251,15 +386,6 @@ class CreateZoneAction(AbstractAction):
         'name': ParamAnnotation(required=True, max_length=255),
         'description': ParamAnnotation(max_length=2048)
     }
-
-    class Result(object):
-        def __init__(self):
-            self.error = None
-            self.value = None
-
-    class CreateZoneResult(object):
-        def __init__(self):
-            self.inventory = None
 
     def __init__(self):
         super(CreateZoneAction, self).__init__()
